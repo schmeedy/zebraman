@@ -10,5 +10,6 @@ There are 2 implementations:
 `./build.sh` produces a docker image `schmeedy/zebraman:latest`
 
 ## Running
+You can use image from Docker Hub:
 * Java version: `docker run --rm -it schmeedy/zebraman`
 * Scala version: `docker run --rm -it schmeedy/zebraman -scala`

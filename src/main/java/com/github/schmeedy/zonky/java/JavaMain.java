@@ -7,7 +7,7 @@ import java.time.LocalDateTime;
 import java.util.*;
 
 public class JavaMain {
-    private static int CHECK_INTERVAL_MINUTES = 1;
+    private static int CHECK_INTERVAL_MINUTES = 5;
 
     private static List<Loan> allLoansSince(LocalDateTime dt, ZonkyClient client) {
         List<Loan> allPages = new ArrayList<>();

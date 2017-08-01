@@ -1,14 +1,14 @@
 package com.github.schmeedy.zonky.scala
 
 import java.nio.charset.{Charset, StandardCharsets}
+import java.time.LocalDateTime
 
 import akka.NotUsed
-import akka.actor.{Actor, ActorSystem, Props, Status}
+import akka.actor.ActorSystem
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.headers._
 import akka.http.scaladsl.model.{HttpRequest, HttpResponse}
 import akka.http.scaladsl.util.FastFuture
-import akka.pattern.pipe
 import akka.stream.scaladsl.{Sink, Source}
 import akka.stream.{ActorMaterializer, Materializer}
 import com.github.schmeedy.zonky.java.{Reporter, Loan => JLoan}
@@ -21,6 +21,7 @@ import scala.collection.immutable
 import scala.concurrent.Future
 import scala.concurrent.duration._
 import scala.language.postfixOps
+import scala.util.{Failure, Success}
 
 case class Loan(id: Int, name: String, url: String) {
   def asJava: JLoan = new JLoan(id, name, url)
@@ -35,63 +36,41 @@ object ScalaMain extends App {
   implicit val reporter = Reporter.CONSOLE
   val httpClient = HttpClient()
 
+  import system.dispatcher
+
   /**
     * Fetches a single page of most recent loans
     */
-  def fetchMostRecentLoans(pageNo: Int): Future[Seq[Loan]] = {
+  def fetchMostRecentLoans(since: Option[LocalDateTime], pageNo: Int): Future[Seq[Loan]] = {
+    val filter = since.map(dt => s"?datePublished__gt=$dt").getOrElse("")
     val request = HttpRequest(
-      uri = "https://api.zonky.cz/loans/marketplace",
+      uri = s"https://api.zonky.cz/loans/marketplace$filter",
       headers = immutable.Seq(
         `User-Agent`("ZebraMan/0.1 (https://github.com/schmeedy/zebraman)"),
         RawHeader("X-Page", pageNo.toString),
-        RawHeader("X-Order", "-datePublished")
+        RawHeader("X-Order", "-datePublished"),
       )
     )
     httpClient.executeExpectJson[Seq[Loan]](request)
   }
 
-  // construct a stream source of recent loans across all pages
-  val pages: Source[Seq[Loan], NotUsed] = Source(Stream.from(0)).mapAsync(1)(fetchMostRecentLoans)
-  val loans: Source[Loan, NotUsed] = pages.mapConcat(ls => immutable.Seq(ls:_*))
-
-  // check which loan is currently the last one and setup periodic checks
-  loans.take(1).runWith(Sink.foreach { lastLoan =>
-    reporter.timerStarted(lastLoan.asJava, CHECK_INTERVAL.toMillis)
-    system.actorOf(Props(new NewLoanChecker(loans, CHECK_INTERVAL, lastLoan.id)))
-  })
-}
-
-/**
-  * A simple actor that remembers the last loan it has seen so far and checks for new loans periodically
-  */
-class NewLoanChecker(loans: Source[Loan, NotUsed], checkFrequency: FiniteDuration, var lastSeenId: Int)
-                    (implicit mat: Materializer, reporter: Reporter) extends Actor {
-
-  import NewLoanChecker._
-  import context.dispatcher
-
-  private val timer = context.system.scheduler.schedule(checkFrequency, checkFrequency, self, CheckingTime)
-
-  override def receive: Receive = {
-    case CheckingTime =>
-      val newLoans = loans.takeWhile(_.id != lastSeenId).runWith(Sink.seq)
-      newLoans.map(NewLoans) pipeTo self
-
-    case NewLoans(nls) =>
-      val newLoansJava = nls.map(_.asJava).asJava
-      reporter.newLoansFetched(newLoansJava)
-      nls.lastOption.foreach { lastLoan =>
-        lastSeenId = lastLoan.id
-      }
-
-    case Status.Failure(err) => err.printStackTrace()
+  def loansSince(since: Option[LocalDateTime]): Source[Loan, NotUsed] = {
+    // construct a stream source of recent loans across all pages
+    val allPages = Source(Stream.from(0)).mapAsync(1)(fetchMostRecentLoans(since, _))
+    allPages.takeWhile(_.nonEmpty).mapConcat(ls => immutable.Seq(ls:_*))
   }
 
-  override def postStop(): Unit = timer.cancel()
-}
-object NewLoanChecker {
-  object CheckingTime
-  case class NewLoans(loans: Seq[Loan])
+  // check which loan is currently the last one and setup periodic checks
+  loansSince(None).take(1).runWith(Sink.foreach { lastLoan =>
+    system.scheduler.schedule(CHECK_INTERVAL, CHECK_INTERVAL) {
+      val since = LocalDateTime.now().minusSeconds(CHECK_INTERVAL.toSeconds)
+      loansSince(Some(since)).runWith(Sink.seq) onComplete {
+        case Success(loans) => reporter.newLoansFetched(loans.map(_.asJava).asJava)
+        case Failure(e) => e.printStackTrace()
+      }
+    }
+    reporter.timerStarted(lastLoan.asJava, CHECK_INTERVAL.toMillis)
+  })
 }
 
 /**
